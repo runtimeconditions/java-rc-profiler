@@ -23,6 +23,8 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-24.04
+    outputs:
+      stable: ${{ steps.kind.outputs.stable }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -33,10 +35,17 @@ jobs:
           java-version: '21'
           cache: maven
       - name: Check the release version
+        id: kind
         run: |
           if [[ ! "$RC_PROFILER_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo 'release tags must have the form vMAJOR.MINOR.PATCH, optionally with a prerelease suffix' >&2
             exit 1
+          fi
+          # Only a stable release gets system packages and is announced to Homebrew, apt and yum.
+          if [[ "$RC_PROFILER_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "stable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "stable=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Build and test the jar at the release version
         run: |
@@ -50,22 +59,37 @@ jobs:
           test -s "$jar"
           test "$(java -jar "$jar" --version)" = "$version"
           java -jar "$jar" --help
-      - name: Package the jar and the launcher
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        if: steps.kind.outputs.stable == 'true'
+        with:
+          go-version: '1.26.5'
+          cache: false
+      - name: Install nfpm
+        if: steps.kind.outputs.stable == 'true'
+        env:
+          GOBIN: ${{ runner.temp }}/release-tools
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$GOBIN" >> "$GITHUB_PATH"
+      - name: Test the packaging helpers
+        run: python3 -m unittest scripts/test_release_package.py
+      - name: Build the release files
         run: |
           version="${RC_PROFILER_VERSION#v}"
-          assets="$RUNNER_TEMP/release-assets"
-          package="$RUNNER_TEMP/package/rc-profiler-java_$version"
-          mkdir -p "$assets" "$package"
-          cp "target/runtimeconditions-java-profiler-$version.jar" "$assets/runtimeconditions-java-profiler-$version.jar"
-          cp "target/runtimeconditions-java-profiler-$version.jar" "$package/runtimeconditions-java-profiler.jar"
-          cp distribution/rc-profiler-java README.md LICENSE "$package/"
-          tar -C "$RUNNER_TEMP/package" -czf "$assets/rc-profiler-java_$version.tar.gz" "rc-profiler-java_$version"
+          flags=()
+          if [[ "${{ steps.kind.outputs.stable }}" == true ]]; then flags+=(--system-packages); fi
+          python3 scripts/release-package.py --version "$RC_PROFILER_VERSION" \
+            --jar "target/runtimeconditions-java-profiler-$version.jar" \
+            --output "$RUNNER_TEMP/release-assets" "${flags[@]}"
       - name: Check that the archive runs
         run: |
           version="${RC_PROFILER_VERSION#v}"
           mkdir -p "$RUNNER_TEMP/unpacked"
           tar -C "$RUNNER_TEMP/unpacked" -xzf "$RUNNER_TEMP/release-assets/rc-profiler-java_$version.tar.gz"
           test "$("$RUNNER_TEMP/unpacked/rc-profiler-java_$version/rc-profiler-java" --version)" = "$version"
+      - name: Install the system packages in clean Ubuntu, Debian and Rocky Linux containers
+        if: steps.kind.outputs.stable == 'true'
+        run: scripts/check-packages.sh "$RUNNER_TEMP/release-assets"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets
@@ -84,14 +108,13 @@ jobs:
         with:
           name: release-assets
           path: release-assets
-      - name: Verify the assets and create checksums
+      - name: Verify the assets against their checksums
         working-directory: release-assets
         run: |
           version="${RC_PROFILER_VERSION#v}"
           test -s "runtimeconditions-java-profiler-$version.jar"
           test -s "rc-profiler-java_$version.tar.gz"
-          sha256sum *.jar *.tar.gz > checksums.txt
-          sha256sum --check checksums.txt
+          sha256sum --check SHA256SUMS
       - name: Publish the tagged release
         working-directory: release-assets
         env:
@@ -108,10 +131,56 @@ jobs:
               echo 'refusing to replace an already published release' >&2
               exit 1
             fi
-            gh release upload "$RC_PROFILER_VERSION" *.jar *.tar.gz checksums.txt --repo "$GITHUB_REPOSITORY" --clobber
+            gh release upload "$RC_PROFILER_VERSION" * --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$RC_PROFILER_VERSION" *.jar *.tar.gz checksums.txt \
+            gh release create "$RC_PROFILER_VERSION" * \
               --repo "$GITHUB_REPOSITORY" --verify-tag --draft --generate-notes --title "$RC_PROFILER_VERSION"
           fi
           gh release edit "$RC_PROFILER_VERSION" --repo "$GITHUB_REPOSITORY" \
             --draft=false --prerelease="$prerelease" --latest="$latest"
+
+  notify-homebrew:
+    needs: [build, publish]
+    if: needs.build.outputs.stable == 'true'
+    runs-on: ubuntu-24.04
+    environment: package-distribution
+    permissions:
+      contents: none
+    steps:
+      - name: Check that the dispatch token is configured
+        id: token
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_REPO_DISPATCH_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "::notice::HOMEBREW_REPO_DISPATCH_TOKEN is not set, so the Homebrew formula is not updated"; fi
+      - name: Trigger the Homebrew formula update
+        if: steps.token.outputs.present == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.HOMEBREW_REPO_DISPATCH_TOKEN }}
+          repository: runtimeconditions/homebrew-tools
+          event-type: rc-profiler-java-release-published
+          client-payload: '{"tag":"${{ github.ref_name }}"}'
+
+  notify-linux-packages:
+    needs: [build, publish]
+    if: needs.build.outputs.stable == 'true'
+    runs-on: ubuntu-24.04
+    environment: package-distribution
+    permissions:
+      contents: none
+    steps:
+      - name: Check that the dispatch token is configured
+        id: token
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_REPO_DISPATCH_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "::notice::HOMEBREW_REPO_DISPATCH_TOKEN is not set, so the apt and yum repositories are not updated"; fi
+      - name: Trigger the apt and yum repository publication
+        if: steps.token.outputs.present == 'true'
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.HOMEBREW_REPO_DISPATCH_TOKEN }}
+          repository: runtimeconditions/packages
+          event-type: rc-profiler-java-release-published
+          client-payload: '{"tag":"${{ github.ref_name }}"}'

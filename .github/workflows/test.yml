@@ -25,3 +25,38 @@ jobs:
           java-version: ${{ matrix.java }}
           cache: maven
       - run: mvn -B -ntp verify
+
+  # Builds the deb, rpm and Homebrew formula as a release would, and installs the packages in clean containers that
+  # have no Java. A release builds them itself, so this is skipped on a tag.
+  packages:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: '1.26.5'
+          cache: false
+      - name: Install nfpm
+        env:
+          GOBIN: ${{ runner.temp }}/release-tools
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$GOBIN" >> "$GITHUB_PATH"
+      - name: Test the packaging helpers
+        run: python3 -m unittest scripts/test_release_package.py
+      - name: Build the jar
+        run: mvn -B -ntp -DskipTests package
+      - name: Build the packages
+        run: |
+          jar=$(ls target/runtimeconditions-java-profiler-*.jar | grep -v original)
+          python3 scripts/release-package.py --version v0.0.0 --jar "$jar" --output "$RUNNER_TEMP/packages" --system-packages
+      - name: Install them in clean Ubuntu, Debian and Rocky Linux containers
+        run: scripts/check-packages.sh "$RUNNER_TEMP/packages"

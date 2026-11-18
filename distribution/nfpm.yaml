@@ -1,0 +1,17 @@
+name: rc-profiler-java
+arch: ${GOARCH}
+platform: linux
+version: ${PACKAGE_VERSION}
+release: 1
+section: utils
+priority: optional
+maintainer: Runtime Conditions <maintainers@runtimeconditions.io>
+description: Runtime Conditions profiler for Java codebases, with its own Java runtime
+vendor: Runtime Conditions
+homepage: https://github.com/runtimeconditions/java-rc-profiler
+license: MIT
+contents:
+  - src: usr
+    dst: /usr
+    type: tree
+umask: 0o022
